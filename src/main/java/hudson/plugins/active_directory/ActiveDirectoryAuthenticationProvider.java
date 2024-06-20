@@ -25,7 +25,6 @@ package hudson.plugins.active_directory;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com4j.COM4J;
-import com4j.Com4jObject;
 import com4j.ComException;
 import com4j.ExecutionException;
 import com4j.Variant;
@@ -54,9 +53,10 @@ import org.acegisecurity.userdetails.UserDetailsService;
 import org.acegisecurity.userdetails.UsernameNotFoundException;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
+import java.util.Stack;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -219,6 +219,7 @@ public class ActiveDirectoryAuthenticationProvider extends AbstractActiveDirecto
                         // now we got the DN of the user
                         IADsOpenDSObject dso = COM4J.getObject(IADsOpenDSObject.class,"LDAP:",null);
 
+                        com4j.typelibs.activeDirectory.
                         // turns out we don't need DN for authentication
                         // we can bind with the user name
                         // dso.openDSObject("LDAP://"+context,args[0],args[1],1);
@@ -239,15 +240,7 @@ public class ActiveDirectoryAuthenticationProvider extends AbstractActiveDirecto
                         if (usr == null)    // the user name was in fact a group
                             throw new UsernameNotFoundException("User not found: "+ username);
 
-                        List<GrantedAuthority> groups = new ArrayList<>();
-                        for( Com4jObject g : usr.groups() ) {
-                            if (g==null) {
-                                continue;   // according to JENKINS-17357 in some environment the collection contains null
-                            }
-                            IADsGroup grp = g.queryInterface(IADsGroup.class);
-                            // cut "CN=" and make that the role name
-                            groups.add(new GrantedAuthorityImpl(grp.name().substring(3)));
-                        }
+                        Set<GrantedAuthority> groups = resolveGroups(dn, usr, dso);
                         groups.add(SecurityRealm.AUTHENTICATED_AUTHORITY);
 
                         LOGGER.log(Level.FINE, "Login successful: {0} dn={1}", new Object[] {username, dn});
@@ -382,6 +375,63 @@ public class ActiveDirectoryAuthenticationProvider extends AbstractActiveDirecto
 
             throw new CacheAuthenticationException("Authentication failed because there was a problem caching group " +  groupname, e);
         }
+    }
+
+    private Set<GrantedAuthority> resolveGroups(String userDN, IADsUser usr, IADsOpenDSObject dso) {
+        Set<GrantedAuthority> groups = new HashSet<>();
+
+        Stack<String> q = new Stack<>();
+        try {
+            Object memberOf = usr.get("memberOf");
+            if (memberOf instanceof String) {
+                LOGGER.fine(userDN + " is a member of " + memberOf);
+                q.push((String) memberOf);
+            } else if (memberOf instanceof Object[]) {
+                for (Object groupDN : (Object[]) memberOf) {
+                    LOGGER.fine(userDN + " is a member of " + groupDN);
+                    q.push((String) groupDN);
+                }
+            }
+        } catch (ComException e) {
+            if (e.getHRESULT() == 0x8000500d) {
+                // ADSI throws a E_ADS_PROPERTY_NOT_FOUND 0x8000500d when the memberOf is empty (i.e. not a member of anything)
+                LOGGER.fine(userDN + " is not a member of any groups.");
+            } else {
+                throw e;
+            }
+        }
+
+        while (!q.isEmpty()) {
+            String identity = q.pop();
+            IADsGroup grp = dso.openDSObject(dnToLdapUrl(identity), null, null, ADSI_PASSWORDLESS_FLAGS)
+                    .queryInterface(IADsGroup.class);
+
+            if (!groups.add(new GrantedAuthorityImpl(grp.get("cn").toString()))) {
+                continue;
+            }
+
+            try {
+                LOGGER.log(Level.FINE, "Trying to get the groups of of {0}", identity);
+                Object memberOf = grp.get("memberOf");
+                if (memberOf instanceof String) {
+                    LOGGER.fine(identity + " is a member of " + memberOf);
+                    q.push((String) memberOf);
+                } else if (memberOf instanceof Object[]) {
+                    for (Object groupDN : (Object[]) memberOf) {
+                        LOGGER.fine(identity + " is a member of " + groupDN);
+                        q.push((String) groupDN);
+                    }
+                }
+            } catch (ComException e) {
+                if (e.getHRESULT() == 0x8000500d) {
+                    // ADSI throws a E_ADS_PROPERTY_NOT_FOUND 0x8000500d when the memberOf is empty (i.e. not a member of anything)
+                    LOGGER.fine(identity + " is not a member of any groups.");
+                } else {
+                    throw e;
+                }
+            }
+        }
+        return groups;
     }
 
 	private static final Logger LOGGER = Logger.getLogger(ActiveDirectoryAuthenticationProvider.class.getName());
